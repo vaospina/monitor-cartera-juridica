@@ -68,12 +68,19 @@ def mes_label(offset=0):
 # ─────────────────────────────────────────────
 def evaluar_regla(vec):
     """
-    vec: [mora_act, mora_ant, mora-2, mora-3, mora-4, ...]  (días en mora)
+    vec: [mora_act, mora_ant, mora-2, mora-3, mora-4, mora-5, ...]  (días en mora)
     Ventana 5 meses: posiciones 0-4
-    Regla:
+    Regla base:
       pos 0 (actual)   → obligatorio < MORA_LIM
       pos 1 (anterior) → obligatorio < MORA_LIM
       pos 2, 3, 4      → máximo 1 puede ser >= MORA_LIM (gabela)
+
+    Condición ADICIONAL para gabela:
+      El mes 6 (pos 5) DEBE existir y ser < MORA_LIM.
+      Esto garantiza que el cliente tenía historial de buen pagador ANTES
+      de la ventana, evitando que un cliente recién al día (4 meses) salga
+      vía gabela usando como "mes malo" el mes en que entró al proceso.
+
     Retorna (cumple, meses_ok, tiene_gabela)
     """
     if len(vec) < MESES_VENTANA:
@@ -89,11 +96,24 @@ def evaluar_regla(vec):
         ok = sum(1 for v in w if v < MORA_LIM)
         return False, ok, False
 
-    malos_resto = sum(1 for v in w[2:] if v >= MORA_LIM)
-    cumple       = malos_resto <= 1
-    tiene_gabela = malos_resto == 1
+    malos_resto  = sum(1 for v in w[2:] if v >= MORA_LIM)
     ok           = sum(1 for v in w if v < MORA_LIM)
-    return cumple, ok, tiene_gabela
+
+    if malos_resto == 0:
+        # Cumple sin gabela
+        return True, ok, False
+
+    if malos_resto == 1:
+        # Tiene potencial gabela — validar historial previo
+        # El mes 6 (posición 5) debe existir y estar al día
+        mes6 = vec[5] if len(vec) > 5 else None
+        if mes6 is not None and mes6 < MORA_LIM:
+            return True, ok, True   # cumple CON gabela — cliente juicioso
+        else:
+            return False, ok, False  # no cumple — sin historial previo suficiente
+
+    # malos_resto >= 2 → no cumple
+    return False, ok, False
 
 
 def meses_para_cumplir(vec):
@@ -544,11 +564,11 @@ with cp:
         st.bar_chart(df_proy.set_index("Mes")["Salen ese mes"])
         st.markdown("*Acumulado*")
         st.line_chart(df_proy.set_index("Mes")["Acumulado créditos"])
-        st.dataframe(df_proy, hide_index=True, use_container_width=True,
-            column_config={
-                "Capital acumulado":    st.column_config.NumberColumn(format="$ %d"),
-                "Liberación acumulada": st.column_config.NumberColumn(format="$ %d"),
-            })
+        # Tabla con formato COP legible
+        df_proy_fmt = df_proy.copy()
+        df_proy_fmt["Capital acumulado"]    = df_proy_fmt["Capital acumulado"].apply(fmt_cop)
+        df_proy_fmt["Liberación acumulada"] = df_proy_fmt["Liberación acumulada"].apply(fmt_cop)
+        st.dataframe(df_proy_fmt, hide_index=True, use_container_width=True)
     else:
         st.info("Sin créditos proyectados para salir en 6 meses.")
 
@@ -585,8 +605,9 @@ if tiene_cal and mejoran > 0:
         if not df_l.empty:
             df_l = df_l.set_index("Calificación")
             st.bar_chart(df_l["Liberación"])
-            st.dataframe(df_l.reset_index(), hide_index=True, use_container_width=True,
-                column_config={"Liberación": st.column_config.NumberColumn(format="$ %d")})
+            df_l_fmt = df_l.reset_index().copy()
+            df_l_fmt["Liberación"] = df_l_fmt["Liberación"].apply(fmt_cop)
+            st.dataframe(df_l_fmt, hide_index=True, use_container_width=True)
     with cb:
         st.markdown("**Distribución por calificación**")
         d2 = {}
@@ -601,6 +622,127 @@ if tiene_cal and mejoran > 0:
         if not df_d.empty:
             st.bar_chart(df_d.set_index("Calificación")["Clientes"])
             st.dataframe(df_d, hide_index=True, use_container_width=True)
+    st.divider()
+
+# ── POTENCIAL DE LIBERACIÓN DE PROVISIONES ─────
+if tiene_cal:
+    st.subheader("🎯 Potencial de liberación de provisiones")
+    st.caption(
+        "Escenario optimista: ¿cuánto se liberaría si TODOS los clientes "
+        "pagaran con mora = 0 este mes y el anterior? "
+        "Solo informativo — no afecta el análisis de procesos."
+    )
+
+    # ── Cálculo escenario real (ya existe en res) ──
+    lib_real_hoy = sum(r["liberacion"] for r in res)
+
+    # ── Cálculo potencial total (todos a mora=0 este mes y anterior) ──
+    lib_potencial_hoy = 0.0
+    filas_potencial   = []
+    for r in res:
+        cal_act = r["cal_act"]
+        if not cal_act or cal_act not in CALIFICACIONES or cal_act == "A":
+            continue
+        # Simular: vec[0]=0, vec[1]=0 → ok2=True para todos
+        cal_nva_pot = mejorar_cal(cal_act)
+        lib_pot     = (PORCENTAJES[cal_act] - PORCENTAJES[cal_nva_pot]) * r["capital"]
+        lib_potencial_hoy += lib_pot
+        filas_potencial.append({
+            "cal_act":   cal_act,
+            "lib_pot":   lib_pot,
+            "lib_real":  r["liberacion"],   # lo que ya libera hoy
+        })
+
+    pct_avance = (lib_real_hoy / lib_potencial_hoy * 100) if lib_potencial_hoy > 0 else 0
+
+    # ── KPIs comparativos ──
+    k1, k2, k3 = st.columns(3)
+    k1.metric(
+        "Liberación real hoy",
+        fmt_cop(lib_real_hoy),
+        help="Clientes que ya cumplen 2 meses con mora = 0"
+    )
+    k2.metric(
+        "Potencial total si todos pagan",
+        fmt_cop(lib_potencial_hoy),
+        help="Si todos los clientes con proceso tuvieran mora = 0 este mes y el anterior"
+    )
+    k3.metric(
+        "% avance vs potencial",
+        f"{pct_avance:.1f}%",
+        help="Cuánto del potencial total ya se está liberando hoy"
+    )
+
+    # Barra de progreso visual
+    st.progress(min(pct_avance / 100, 1.0))
+    st.caption(f"Falta por liberar: **{fmt_cop(lib_potencial_hoy - lib_real_hoy)}**")
+
+    # ── Proyección mes a mes del potencial ──
+    st.markdown("**Proyección de liberación acumulada — escenario optimista**")
+    st.caption(
+        "Mes a mes, asumiendo que cada cliente que está al día HOY "
+        "sigue al día. El potencial total (si todos pagaran) se muestra como referencia."
+    )
+
+    rows_proy_prov = []
+    acum_real = 0.0
+    for offset in range(0, MESES_PROYEC + 1):
+        if offset == 0:
+            lbl = f"{mes_label(0)} (hoy)"
+            # Mes actual: lo que ya se libera
+            acum_real = lib_real_hoy
+        else:
+            lbl = mes_label(offset)
+            # Clientes que cumplen la regla en este mes (meses_falt == offset)
+            # ya están en la proyección de procesos; aquí solo sumamos su liberación
+            nuevos = [r for r in res if r["meses_falt"] == offset and r["mejora"]]
+            acum_real += sum(r["liberacion"] for r in nuevos)
+
+        pct = (acum_real / lib_potencial_hoy * 100) if lib_potencial_hoy > 0 else 0
+        rows_proy_prov.append({
+            "Mes":                    lbl,
+            "_orden":                 offset,
+            "Liberación acumulada":   acum_real,
+            "Potencial total":        lib_potencial_hoy,
+            "% del potencial":        round(pct, 1),
+        })
+
+    df_pp = pd.DataFrame(rows_proy_prov).sort_values("_orden").drop(columns=["_orden"])
+
+    # Gráfica con ambas líneas
+    df_chart = df_pp.set_index("Mes")[["Liberación acumulada","Potencial total"]]
+    st.line_chart(df_chart)
+
+    # Tabla con formato COP
+    df_pp_fmt = df_pp.copy()
+    df_pp_fmt["Liberación acumulada"] = df_pp_fmt["Liberación acumulada"].apply(fmt_cop)
+    df_pp_fmt["Potencial total"]      = df_pp_fmt["Potencial total"].apply(fmt_cop)
+    df_pp_fmt["% del potencial"]      = df_pp_fmt["% del potencial"].apply(lambda x: f"{x:.1f}%")
+    st.dataframe(df_pp_fmt, hide_index=True, use_container_width=True)
+
+    # ── Por calificación: real vs potencial ──
+    st.markdown("**Real vs potencial por calificación**")
+    rows_cal = []
+    for cal in CALIFICACIONES:
+        pot = sum(f["lib_pot"]  for f in filas_potencial if f["cal_act"] == cal)
+        rea = sum(f["lib_real"] for f in filas_potencial if f["cal_act"] == cal)
+        if pot > 0:
+            rows_cal.append({
+                "Calificación":      cal,
+                "Real hoy":          rea,
+                "Potencial total":   pot,
+                "% avance":          round(rea / pot * 100, 1) if pot > 0 else 0,
+                "Faltan por liberar":pot - rea,
+            })
+    if rows_cal:
+        df_cal = pd.DataFrame(rows_cal).set_index("Calificación")
+        st.bar_chart(df_cal[["Real hoy","Potencial total"]])
+        df_cal_fmt = df_cal.reset_index().copy()
+        for col in ["Real hoy","Potencial total","Faltan por liberar"]:
+            df_cal_fmt[col] = df_cal_fmt[col].apply(fmt_cop)
+        df_cal_fmt["% avance"] = df_cal_fmt["% avance"].apply(lambda x: f"{x:.1f}%")
+        st.dataframe(df_cal_fmt, hide_index=True, use_container_width=True)
+
     st.divider()
 
 # ── TABLA DETALLE ──────────────────────────────
@@ -663,12 +805,12 @@ for i, (tab, filtro) in enumerate(zip(tabs, filtros)):
 
         df_t = pd.DataFrame(rows)
         ccfg = {
-            "Capital":            st.column_config.NumberColumn(format="$ %d"),
+            "Capital":            st.column_config.NumberColumn(format="$ %,.0f"),
             "Mora Hipo actual":   st.column_config.NumberColumn(format="%d d"),
             "Mora Hipo anterior": st.column_config.NumberColumn(format="%d d"),
         }
         if tiene_cal:
-            ccfg["Liberación"] = st.column_config.NumberColumn(format="$ %d")
+            ccfg["Liberación"] = st.column_config.NumberColumn(format="$ %,.0f")
         st.dataframe(df_t, hide_index=True, use_container_width=True, column_config=ccfg)
 
         buf = io.BytesIO()
