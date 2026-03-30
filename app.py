@@ -786,6 +786,17 @@ for i, (tab, filtro) in enumerate(zip(tabs, filtros)):
             continue
         rows = []
         for r in filas:
+            # ── Columna S: liberación potencial si mora actual = 0 ──
+            # Condición: mes anterior (vec[1]) ya era 0 Y tiene calificación mejorable
+            cal = r["cal_act"]
+            vec_r = r["vec"]
+            mora_ant_r = vec_r[1] if len(vec_r) > 1 and vec_r[1] is not None else None
+            if cal and cal in CALIFICACIONES and cal != "A" and mora_ant_r == 0:
+                cal_nva_pot  = mejorar_cal(cal)
+                lib_pot_s    = (PORCENTAJES[cal] - PORCENTAJES[cal_nva_pot]) * r["capital"]
+            else:
+                lib_pot_s = 0.0
+
             row = {
                 "Estado":                r["estado"],
                 "Cédula":                r["cedula"],
@@ -804,19 +815,21 @@ for i, (tab, filtro) in enumerate(zip(tabs, filtros)):
                 "Nota":                  r["rec"],
             }
             if tiene_cal:
-                row["Cal. actual"] = r["cal_act"] or "—"
-                row["Cal. nueva"]  = r["cal_nva"] or "—"
-                row["Liberación"]  = r["liberacion"]
+                row["Cal. actual"]            = r["cal_act"] or "—"
+                row["Cal. nueva"]             = r["cal_nva"] or "—"
+                row["Liberación real ($)"]    = r["liberacion"]        # col R
+                row["Liberación potencial ($)"] = lib_pot_s            # col S
             rows.append(row)
 
         df_t = pd.DataFrame(rows)
         ccfg = {
-            "Capital":            st.column_config.NumberColumn(format="$ %,.0f"),
-            "Mora Hipo actual":   st.column_config.NumberColumn(format="%d d"),
-            "Mora Hipo anterior": st.column_config.NumberColumn(format="%d d"),
+            "Capital":                   st.column_config.NumberColumn(format="$ %,.0f"),
+            "Mora Hipo actual":          st.column_config.NumberColumn(format="%d d"),
+            "Mora Hipo anterior":        st.column_config.NumberColumn(format="%d d"),
         }
         if tiene_cal:
-            ccfg["Liberación"] = st.column_config.NumberColumn(format="$ %,.0f")
+            ccfg["Liberación real ($)"]       = st.column_config.NumberColumn(format="$ %,.0f")
+            ccfg["Liberación potencial ($)"]  = st.column_config.NumberColumn(format="$ %,.0f")
         st.dataframe(df_t, hide_index=True, use_container_width=True, column_config=ccfg)
 
         buf = io.BytesIO()
