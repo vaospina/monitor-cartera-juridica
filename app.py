@@ -628,120 +628,126 @@ if tiene_cal and mejoran > 0:
 if tiene_cal:
     st.subheader("🎯 Potencial de liberación de provisiones")
     st.caption(
-        "Escenario optimista: ¿cuánto se liberaría si TODOS los clientes "
-        "pagaran con mora = 0 este mes y el anterior? "
-        "Solo informativo — no afecta el análisis de procesos."
+        "Por cada mes de salida: ¿cuánto liberarían los clientes que salen ese mes "
+        "si todos tuvieran mora = 0? vs. cuántos ya lo cumplen hoy. Solo informativo."
     )
 
-    # ── Cálculo escenario real (ya existe en res) ──
-    lib_real_hoy = sum(r["liberacion"] for r in res)
+    # ────────────────────────────────────────────
+    # Mes actual (offset=0): clientes que YA cumplen la regla (RETIRAR)
+    # Meses futuros (offset=1-6): clientes proyectados a salir ese mes
+    # Para cada cohorte calculamos:
+    #   pot  = suma liberación si todos en esa cohorte tuvieran mora=0 hoy y anterior
+    #   real = suma liberación de los que ya cumplen mora=0 (ok2=True)
+    # ────────────────────────────────────────────
 
-    # ── Cálculo potencial total (todos a mora=0 este mes y anterior) ──
-    lib_potencial_hoy = 0.0
-    filas_potencial   = []
-    for r in res:
-        cal_act = r["cal_act"]
-        if not cal_act or cal_act not in CALIFICACIONES or cal_act == "A":
-            continue
-        # Simular: vec[0]=0, vec[1]=0 → ok2=True para todos
-        cal_nva_pot = mejorar_cal(cal_act)
-        lib_pot     = (PORCENTAJES[cal_act] - PORCENTAJES[cal_nva_pot]) * r["capital"]
-        lib_potencial_hoy += lib_pot
-        filas_potencial.append({
-            "cal_act":   cal_act,
-            "lib_pot":   lib_pot,
-            "lib_real":  r["liberacion"],   # lo que ya libera hoy
-        })
-
-    pct_avance = (lib_real_hoy / lib_potencial_hoy * 100) if lib_potencial_hoy > 0 else 0
-
-    # ── KPIs comparativos ──
-    k1, k2, k3 = st.columns(3)
-    k1.metric(
-        "Liberación real hoy",
-        fmt_cop(lib_real_hoy),
-        help="Clientes que ya cumplen 2 meses con mora = 0"
-    )
-    k2.metric(
-        "Potencial total si todos pagan",
-        fmt_cop(lib_potencial_hoy),
-        help="Si todos los clientes con proceso tuvieran mora = 0 este mes y el anterior"
-    )
-    k3.metric(
-        "% avance vs potencial",
-        f"{pct_avance:.1f}%",
-        help="Cuánto del potencial total ya se está liberando hoy"
-    )
-
-    # Barra de progreso visual
-    st.progress(min(pct_avance / 100, 1.0))
-    st.caption(f"Falta por liberar: **{fmt_cop(lib_potencial_hoy - lib_real_hoy)}**")
-
-    # ── Proyección mes a mes del potencial ──
-    st.markdown("**Proyección de liberación acumulada — escenario optimista**")
-    st.caption(
-        "Mes a mes, asumiendo que cada cliente que está al día HOY "
-        "sigue al día. El potencial total (si todos pagaran) se muestra como referencia."
-    )
-
-    rows_proy_prov = []
-    acum_real = 0.0
+    rows_mes = []
     for offset in range(0, MESES_PROYEC + 1):
         if offset == 0:
-            lbl = f"{mes_label(0)} (hoy)"
-            # Mes actual: lo que ya se libera
-            acum_real = lib_real_hoy
+            lbl     = f"{mes_label(0)} (hoy)"
+            cohorte = [r for r in res if r["estado"] == "RETIRAR"]
         else:
-            lbl = mes_label(offset)
-            # Clientes que cumplen la regla en este mes (meses_falt == offset)
-            # ya están en la proyección de procesos; aquí solo sumamos su liberación
-            nuevos = [r for r in res if r["meses_falt"] == offset and r["mejora"]]
-            acum_real += sum(r["liberacion"] for r in nuevos)
+            lbl     = mes_label(offset)
+            cohorte = [r for r in res if r["meses_falt"] == offset]
 
-        pct = (acum_real / lib_potencial_hoy * 100) if lib_potencial_hoy > 0 else 0
-        rows_proy_prov.append({
-            "Mes":                    lbl,
-            "_orden":                 offset,
-            "Liberación acumulada":   acum_real,
-            "Potencial total":        lib_potencial_hoy,
-            "% del potencial":        round(pct, 1),
+        if not cohorte:
+            rows_mes.append({
+                "Mes":              lbl,
+                "_orden":           offset,
+                "Clientes cohorte": 0,
+                "Potencial ($)":    0.0,
+                "Real hoy ($)":     0.0,
+                "Clientes reales":  0,
+                "% avance":         0.0,
+            })
+            continue
+
+        pot  = 0.0
+        real = 0.0
+        n_real = 0
+
+        for r in cohorte:
+            cal = r["cal_act"]
+            if not cal or cal not in CALIFICACIONES or cal == "A":
+                continue
+            cal_nva_pot = mejorar_cal(cal)
+            lib_pot     = (PORCENTAJES[cal] - PORCENTAJES[cal_nva_pot]) * r["capital"]
+            pot += lib_pot
+            # Ya cumple mora=0 dos meses
+            if r["mejora"]:
+                real   += r["liberacion"]
+                n_real += 1
+
+        pct = (real / pot * 100) if pot > 0 else 0.0
+        rows_mes.append({
+            "Mes":              lbl,
+            "_orden":           offset,
+            "Clientes cohorte": len(cohorte),
+            "Potencial ($)":    pot,
+            "Real hoy ($)":     real,
+            "Clientes reales":  n_real,
+            "% avance":         round(pct, 1),
         })
 
-    df_pp = pd.DataFrame(rows_proy_prov).sort_values("_orden").drop(columns=["_orden"])
+    df_mes = pd.DataFrame(rows_mes).sort_values("_orden").drop(columns=["_orden"])
 
-    # Gráfica con ambas líneas
-    df_chart = df_pp.set_index("Mes")[["Liberación acumulada","Potencial total"]]
-    st.line_chart(df_chart)
+    # ── KPI resumen total ──
+    tot_pot  = df_mes["Potencial ($)"].sum()
+    tot_real = df_mes["Real hoy ($)"].sum()
+    tot_pct  = (tot_real / tot_pot * 100) if tot_pot > 0 else 0
 
-    # Tabla con formato COP
-    df_pp_fmt = df_pp.copy()
-    df_pp_fmt["Liberación acumulada"] = df_pp_fmt["Liberación acumulada"].apply(fmt_cop)
-    df_pp_fmt["Potencial total"]      = df_pp_fmt["Potencial total"].apply(fmt_cop)
-    df_pp_fmt["% del potencial"]      = df_pp_fmt["% del potencial"].apply(lambda x: f"{x:.1f}%")
-    st.dataframe(df_pp_fmt, hide_index=True, use_container_width=True)
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Potencial total (todos los meses)", fmt_cop(tot_pot))
+    k2.metric("Real acumulado hoy",                fmt_cop(tot_real))
+    k3.metric("% avance total",                    f"{tot_pct:.1f}%")
+    st.progress(min(tot_pct / 100, 1.0))
+    st.caption(f"Falta por capturar: **{fmt_cop(tot_pot - tot_real)}**")
 
-    # ── Por calificación: real vs potencial ──
-    st.markdown("**Real vs potencial por calificación**")
-    rows_cal = []
-    for cal in CALIFICACIONES:
-        pot = sum(f["lib_pot"]  for f in filas_potencial if f["cal_act"] == cal)
-        rea = sum(f["lib_real"] for f in filas_potencial if f["cal_act"] == cal)
-        if pot > 0:
-            rows_cal.append({
-                "Calificación":      cal,
-                "Real hoy":          rea,
-                "Potencial total":   pot,
-                "% avance":          round(rea / pot * 100, 1) if pot > 0 else 0,
-                "Faltan por liberar":pot - rea,
-            })
-    if rows_cal:
-        df_cal = pd.DataFrame(rows_cal).set_index("Calificación")
-        st.bar_chart(df_cal[["Real hoy","Potencial total"]])
-        df_cal_fmt = df_cal.reset_index().copy()
-        for col in ["Real hoy","Potencial total","Faltan por liberar"]:
-            df_cal_fmt[col] = df_cal_fmt[col].apply(fmt_cop)
-        df_cal_fmt["% avance"] = df_cal_fmt["% avance"].apply(lambda x: f"{x:.1f}%")
-        st.dataframe(df_cal_fmt, hide_index=True, use_container_width=True)
+    st.divider()
+
+    # ── Gráfica barras: potencial vs real por mes ──
+    st.markdown("**Potencial vs real por mes de salida**")
+    df_chart = df_mes.set_index("Mes")[["Potencial ($)", "Real hoy ($)"]]
+    st.bar_chart(df_chart)
+
+    # ── Tabla detallada por mes ──
+    df_fmt = df_mes.copy()
+    df_fmt["Potencial ($)"]  = df_fmt["Potencial ($)"].apply(fmt_cop)
+    df_fmt["Real hoy ($)"]   = df_fmt["Real hoy ($)"].apply(fmt_cop)
+    df_fmt["% avance"]       = df_fmt["% avance"].apply(lambda x: f"{x:.1f}%")
+    df_fmt = df_fmt.rename(columns={
+        "Clientes cohorte": "Clientes que salen",
+        "Clientes reales":  "Ya cumplen mora=0",
+    })
+    st.dataframe(df_fmt, hide_index=True, use_container_width=True)
+
+    # ── Por calificación dentro de cada mes: desglose ──
+    with st.expander("Ver desglose por calificación y mes"):
+        for offset in range(0, MESES_PROYEC + 1):
+            lbl     = f"{mes_label(0)} (hoy)" if offset == 0 else mes_label(offset)
+            cohorte = [r for r in res if r["estado"]=="RETIRAR"] if offset == 0 \
+                      else [r for r in res if r["meses_falt"] == offset]
+            if not cohorte:
+                continue
+            rows_cal = []
+            for cal in CALIFICACIONES:
+                sub = [r for r in cohorte if r["cal_act"] == cal]
+                if not sub:
+                    continue
+                cal_nva_pot = mejorar_cal(cal)
+                pot_cal  = sum((PORCENTAJES[cal]-PORCENTAJES[cal_nva_pot])*r["capital"] for r in sub)
+                real_cal = sum(r["liberacion"] for r in sub if r["mejora"])
+                pct_cal  = (real_cal/pot_cal*100) if pot_cal > 0 else 0
+                rows_cal.append({
+                    "Cal.":           cal,
+                    "Clientes":       len(sub),
+                    "Potencial":      fmt_cop(pot_cal),
+                    "Real hoy":       fmt_cop(real_cal),
+                    "% avance":       f"{pct_cal:.1f}%",
+                    "Falta liberar":  fmt_cop(pot_cal - real_cal),
+                })
+            if rows_cal:
+                st.markdown(f"**{lbl}**")
+                st.dataframe(pd.DataFrame(rows_cal), hide_index=True, use_container_width=True)
 
     st.divider()
 
