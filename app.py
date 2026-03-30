@@ -339,7 +339,7 @@ with st.sidebar:
     st.subheader("1 · Query Cartera")
     st.caption("QUERY CARTERA (D-MM-AAAA).xlsx · Hojas: Hipo y Con")
     cartera_file = st.file_uploader(
-        "Subir Query Cartera", type=["xlsx", "xls"], key="cartera"
+        "Subir Query Cartera", type=["xlsx", "xls"], key="up_cartera"
     )
     if cartera_file:
         with st.spinner("Procesando cartera..."):
@@ -356,7 +356,7 @@ with st.sidebar:
     st.subheader("2 · Procesos Jurídicos")
     st.caption("PROCESOS JURIDICOS.xlsx · Col A: Cédula · Col M: Etapa")
     jur_file = st.file_uploader(
-        "Subir Procesos Jurídicos", type=["xlsx", "xls"], key="juridicos"
+        "Subir Procesos Jurídicos", type=["xlsx", "xls"], key="up_juridicos"
     )
     if jur_file:
         with st.spinner("Procesando jurídicos..."):
@@ -373,7 +373,7 @@ with st.sidebar:
     st.subheader("3 · Calificaciones (opcional)")
     st.caption("CALIFICACIONES.xlsx · Col A: Crédito · Col B: Calificación A-E3")
     cal_file = st.file_uploader(
-        "Subir Calificaciones", type=["xlsx", "xls"], key="calificaciones"
+        "Subir Calificaciones", type=["xlsx", "xls"], key="up_calificaciones"
     )
     if cal_file:
         with st.spinner("Procesando calificaciones..."):
