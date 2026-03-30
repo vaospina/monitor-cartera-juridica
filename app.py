@@ -179,29 +179,57 @@ def proc_vector(f):
 #  ANÁLISIS PRINCIPAL
 # ─────────────────────────────────────────────
 def analizar(cartera, juridicos, calificaciones, vector):
+    """
+    Cruce:
+      1. cartera (por cédula) × juridicos (por cédula) → clientes con proceso
+      2. Para cada cliente con proceso: buscar vector por número de crédito
+      3. mora_act y mora_ant SIEMPRE vienen del vector (col B y C)
+         Solo si no hay vector usa el query como fallback (mora_act_query)
+    """
     if not cartera or not juridicos or not vector:
         return []
 
-    jur_set = set(juridicos.keys())
+    jur_set    = set(juridicos.keys())
     resultados = []
 
     for ced, dat in cartera.items():
+        # ── Paso 1: solo clientes con proceso jurídico ──
         if ced not in jur_set:
             continue
 
-        cred     = dat["credito"]
-        capital  = dat["capital"]
-        tipo     = dat["tipo"]
-        etapa    = juridicos.get(ced, "")
-        mora_act = dat["dias_mora"] or 0
+        cred             = dat["credito"]
+        capital          = dat["capital"]
+        tipo             = dat["tipo"]
+        etapa            = juridicos.get(ced, "")
+        mora_act_query   = dat["dias_mora"] or 0   # solo como fallback
 
-        vec = vector.get(cred, [mora_act])
+        # ── Paso 2: vector por número de crédito ──
+        vec = vector.get(cred)
 
+        # ── Paso 3: mora siempre del vector ──
+        if vec and len(vec) >= 1 and vec[0] is not None:
+            mora_act = vec[0]          # col B del vector
+        else:
+            mora_act = mora_act_query  # fallback si no hay vector
+
+        mora_ant = vec[1] if (vec and len(vec) > 1 and vec[1] is not None) else None
+
+        if not vec:
+            vec = [mora_act]
+
+        # ── Evaluar regla con el vector completo ──
         cumple, meses_ok, tiene_gabela = evaluar_regla(vec)
+        meses_falt = meses_para_cumplir(vec)
 
-        mora_ant = vec[1] if len(vec) > 1 else None
+        # Etiqueta legible del mes proyectado de salida
+        if meses_falt is not None and meses_falt > 0:
+            mes_salida_lbl = mes_label(meses_falt)
+        elif meses_falt == 0:
+            mes_salida_lbl = "Este mes"
+        else:
+            mes_salida_lbl = "—"
 
-        # Estado
+        # ── Estado procesal ──
         if cumple:
             estado = "RETIRAR"
             sufijo = " (con gabela)" if tiene_gabela else ""
@@ -220,45 +248,45 @@ def analizar(cartera, juridicos, calificaciones, vector):
             rec    = f"Mora: {mora_act} días"
             prio   = 4
 
-        # Alerta rodando: al día el mes pasado, en mora este mes
+        # ── Alerta rodando ──
         rodando = (mora_ant is not None and mora_ant < MORA_LIM and mora_act >= MORA_LIM)
 
-        # Meses para cumplir la regla
-        meses_falt = meses_para_cumplir(vec)
+        # ── Provisiones: mora_act = 0 Y mora_ant = 0 (exactamente cero) ──
+        ok2 = (len(vec) >= 2
+               and vec[0] is not None and vec[0] == 0
+               and vec[1] is not None and vec[1] == 0)
 
-        # Provisiones
-        ok2 = (len(vec) >= 2 and vec[0] is not None and vec[0] < MORA_LIM
-               and vec[1] is not None and vec[1] < MORA_LIM)
-        cal_act = calificaciones.get(cred)
-        cal_nva = None
+        cal_act    = calificaciones.get(cred)
+        cal_nva    = None
         liberacion = 0.0
-        mejora = False
+        mejora     = False
         if ok2 and cal_act and cal_act in CALIFICACIONES and cal_act != "A":
             cal_nva    = mejorar_cal(cal_act)
             liberacion = (PORCENTAJES[cal_act] - PORCENTAJES[cal_nva]) * capital
             mejora     = True
 
         resultados.append({
-            "cedula":       ced,
-            "credito":      cred,
-            "capital":      capital,
-            "tipo":         tipo,
-            "etapa":        etapa,
-            "mora_act":     mora_act,
-            "mora_ant":     mora_ant,
-            "vec":          vec,
-            "meses_ok":     meses_ok,
-            "cumple":       cumple,
-            "tiene_gabela": tiene_gabela,
-            "estado":       estado,
-            "rec":          rec,
-            "prio":         prio,
-            "rodando":      rodando,
-            "meses_falt":   meses_falt,
-            "cal_act":      cal_act,
-            "cal_nva":      cal_nva,
-            "liberacion":   liberacion,
-            "mejora":       mejora,
+            "cedula":          ced,
+            "credito":         cred,
+            "capital":         capital,
+            "tipo":            tipo,
+            "etapa":           etapa,
+            "mora_act":        mora_act,
+            "mora_ant":        mora_ant,
+            "vec":             vec,
+            "meses_ok":        meses_ok,
+            "cumple":          cumple,
+            "tiene_gabela":    tiene_gabela,
+            "estado":          estado,
+            "rec":             rec,
+            "prio":            prio,
+            "rodando":         rodando,
+            "meses_falt":      meses_falt,
+            "mes_salida_lbl":  mes_salida_lbl,
+            "cal_act":         cal_act,
+            "cal_nva":         cal_nva,
+            "liberacion":      liberacion,
+            "mejora":          mejora,
         })
 
     resultados.sort(key=lambda x: (x["prio"], -x["capital"]))
@@ -266,6 +294,7 @@ def analizar(cartera, juridicos, calificaciones, vector):
 
 
 def calc_proyeccion(res):
+    """Proyección 6 meses — orden cronológico garantizado (offset 1→6)."""
     rows = []
     acum_cred = 0
     acum_cap  = 0
@@ -277,24 +306,25 @@ def calc_proyeccion(res):
         acum_lib   += sum(r["liberacion"] for r in salidas_mes if r["mejora"])
         rows.append({
             "Mes":                  mes_label(offset),
+            "_orden":               offset,           # para ordenar, oculto en UI
             "Salen ese mes":        len(salidas_mes),
             "Acumulado créditos":   acum_cred,
             "Capital acumulado":    acum_cap,
             "Liberación acumulada": acum_lib,
         })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows).sort_values("_orden").drop(columns=["_orden"])
+    return df
 
 
 def calc_hist_suspensiones(res):
     """
     Suspensiones por mes: mora[offset] < 30 y mora[offset+1] >= 30.
-    Incluye acumulado desde el mes más antiguo hasta el actual.
+    Orden cronológico: mes más antiguo primero → mes actual al final.
     """
     hist = []
-    # Recolectar de más antiguo a más reciente para el acumulado
-    meses_range = list(range(MESES_VENTANA - 1, -1, -1))  # 4,3,2,1,0
     acum = 0
-    for offset in meses_range:
+    # Recorremos de más antiguo (offset alto) a más reciente (offset 0)
+    for offset in range(MESES_VENTANA - 1, -1, -1):
         cnt = 0
         for r in res:
             v = r["vec"]
@@ -307,11 +337,13 @@ def calc_hist_suspensiones(res):
                     cnt += 1
         acum += cnt
         hist.append({
-            "Mes":            mes_label(-offset),
-            "Suspendidos":    cnt,
-            "Acumulado":      acum,
+            "Mes":         mes_label(-offset),
+            "_orden":      -offset,          # offset negativo → cronológico
+            "Suspendidos": cnt,
+            "Acumulado":   acum,
         })
-    return pd.DataFrame(hist)
+    df = pd.DataFrame(hist).sort_values("_orden").drop(columns=["_orden"])
+    return df
 
 # ─────────────────────────────────────────────
 #  SESSION STATE
@@ -484,14 +516,16 @@ if tiene_cal and mejoran > 0:
         for r in res:
             if r["mejora"] and r["cal_act"]:
                 d[r["cal_act"]] = d.get(r["cal_act"],0) + r["liberacion"]
+        # Orden siempre A→E3
         df_l = pd.DataFrame([
-            {"Calificación":k,"Liberación":v,
+            {"Calificación":k,"Liberación":d[k],
              "Clientes":sum(1 for r in res if r["cal_act"]==k and r["mejora"])}
-            for k,v in sorted(d.items(), key=lambda x: CALIFICACIONES.index(x[0]))
+            for k in CALIFICACIONES if k in d
         ])
         if not df_l.empty:
-            st.bar_chart(df_l.set_index("Calificación")["Liberación"])
-            st.dataframe(df_l, hide_index=True, use_container_width=True,
+            df_l = df_l.set_index("Calificación")
+            st.bar_chart(df_l["Liberación"])
+            st.dataframe(df_l.reset_index(), hide_index=True, use_container_width=True,
                 column_config={"Liberación": st.column_config.NumberColumn(format="$ %d")})
     with cb:
         st.markdown("**Distribución por calificación**")
@@ -499,9 +533,10 @@ if tiene_cal and mejoran > 0:
         for r in res:
             if r["cal_act"]:
                 d2[r["cal_act"]] = d2.get(r["cal_act"],0) + 1
+        # Orden siempre A→E3
         df_d = pd.DataFrame([
-            {"Calificación":k,"Clientes":v,"% provisión":f"{PORCENTAJES[k]*100:.1f}%"}
-            for k,v in sorted(d2.items(), key=lambda x: CALIFICACIONES.index(x[0]))
+            {"Calificación":k,"Clientes":d2[k],"% provisión":f"{PORCENTAJES[k]*100:.1f}%"}
+            for k in CALIFICACIONES if k in d2
         ])
         if not df_d.empty:
             st.bar_chart(df_d.set_index("Calificación")["Clientes"])
@@ -542,19 +577,19 @@ for i, (tab, filtro) in enumerate(zip(tabs, filtros)):
         rows = []
         for r in filas:
             row = {
-                "Estado":        r["estado"],
-                "Cédula":        r["cedula"],
-                "Crédito":       r["credito"],
-                "Tipo":          "Hipo" if r["tipo"]=="Hipo" else "Cons.",
-                "Capital":       r["capital"],
-                "Mora actual":   r["mora_act"],
-                "Mora anterior": r["mora_ant"],
-                "Vector 5m":     vec_vis(r["vec"]),
-                "OK/5":          f"{r['meses_ok']}/5",
-                "Gabela":        "Sí" if r["tiene_gabela"] else "—",
-                "Meses p/salir": r["meses_falt"] if r["meses_falt"] is not None else "—",
-                "Etapa":         r["etapa"],
-                "Nota":          r["rec"],
+                "Estado":              r["estado"],
+                "Cédula":              r["cedula"],
+                "Crédito":             r["credito"],
+                "Tipo":                "Hipo" if r["tipo"]=="Hipo" else "Cons.",
+                "Capital":             r["capital"],
+                "Mora actual":         r["mora_act"],
+                "Mora anterior":       r["mora_ant"],
+                "Vector 5m":           vec_vis(r["vec"]),
+                "OK/5":                f"{r['meses_ok']}/5",
+                "Gabela":              "Sí" if r["tiene_gabela"] else "—",
+                "Mes proyectado salida": r["mes_salida_lbl"],
+                "Etapa":               r["etapa"],
+                "Nota":                r["rec"],
             }
             if tiene_cal:
                 row["Cal. actual"] = r["cal_act"] or "—"
