@@ -113,26 +113,63 @@ def meses_para_cumplir(vec):
 # ─────────────────────────────────────────────
 #  PROCESAMIENTO DE ARCHIVOS
 # ─────────────────────────────────────────────
+#  HELPERS ADICIONALES
+# ─────────────────────────────────────────────
+def limpiar_cred(v):
+    """
+    Limpia número de crédito preservando TODOS los dígitos.
+    Evita que Excel convierta 1234560 → 1234560.0 → '123456' (pérdida del cero).
+    """
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return ""
+    if isinstance(v, float):
+        # Si es entero exacto, conviértelo a int primero para evitar decimales
+        if v == int(v):
+            return str(int(v)).strip()
+        return str(v).strip()
+    if isinstance(v, int):
+        return str(v).strip()
+    # String: quitar espacios, comas y ".0" final
+    s = str(v).strip().replace(",", "")
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+# ─────────────────────────────────────────────
 def proc_cartera(f):
-    xf   = pd.ExcelFile(f)
-    rows = {}
+    """
+    Lee Query Cartera (hojas Hipo y Con).
+    Retorna dos dicts por cédula:
+      hipo_por_ced: cédula → {credito, capital, dias_mora, tipo='Hipo'}
+      cons_por_ced: cédula → {credito, capital, dias_mora, tipo='Con'}
+    El crédito hipotecario es el "madre"; el consumo es accesorio.
+    """
+    xf          = pd.ExcelFile(f)
+    hipo_por_ced = {}
+    cons_por_ced = {}
+
     for hoja in ["Hipo", "Con"]:
         if hoja not in xf.sheet_names:
             st.warning(f"Hoja '{hoja}' no encontrada.")
             continue
-        df = xf.parse(hoja, header=None)
+        # Forzar col A (crédito) como string para preservar dígitos
+        df = xf.parse(hoja, header=None, dtype={0: str})
         for _, r in df.iloc[1:].iterrows():
-            ced = limpiar(r.iloc[5] if len(r) > 5 else None)
-            if not ced:
+            ced  = limpiar(r.iloc[5] if len(r) > 5 else None)
+            cred = limpiar_cred(r.iloc[0] if len(r) > 0 else None)
+            if not ced or not cred:
                 continue
-            rows[ced] = {
-                "credito":   limpiar(r.iloc[0] if len(r) > 0 else ""),
-                "cedula":    ced,
-                "capital":   float(r.iloc[12]) if len(r) > 12 and r.iloc[12] not in [None,""] else 0.0,
-                "dias_mora": to_int(r.iloc[19]) or 0 if len(r) > 19 else 0,
-                "tipo":      hoja,
-            }
-    return rows
+            cap  = float(r.iloc[12]) if len(r) > 12 and r.iloc[12] not in [None, ""] else 0.0
+            mora = to_int(r.iloc[19]) if len(r) > 19 else 0
+            mora = mora or 0
+            dat  = {"credito": cred, "cedula": ced, "capital": cap,
+                    "dias_mora": mora, "tipo": hoja}
+            if hoja == "Hipo":
+                hipo_por_ced[ced] = dat
+            else:
+                cons_por_ced[ced] = dat
+
+    return hipo_por_ced, cons_por_ced
 
 
 def proc_juridicos(f):
@@ -148,10 +185,10 @@ def proc_juridicos(f):
 
 
 def proc_calificaciones(f):
-    df   = pd.read_excel(f, header=None)
+    df   = pd.read_excel(f, header=None, dtype={0: str})
     cals = {}
     for _, r in df.iloc[1:].iterrows():
-        cred = limpiar(r.iloc[0] if len(r) > 0 else None)
+        cred = limpiar_cred(r.iloc[0] if len(r) > 0 else None)
         cal  = str(r.iloc[1]).strip().upper() if len(r) > 1 and r.iloc[1] not in [None,""] else ""
         if cred and cal in CALIFICACIONES:
             cals[cred] = cal
@@ -160,13 +197,14 @@ def proc_calificaciones(f):
 
 def proc_vector(f):
     """
-    Col A(0): crédito  Col B(1): mora mes actual  Col C-M(2-12): meses anteriores
-    Retorna dict: credito -> [mora_act, mora_ant, mora-2, ..., mora-11]
+    Col A(0): crédito hipotecario  Col B(1): mora mes actual  Col C-M(2-12): meses anteriores
+    Fuerza col A como string para preservar todos los dígitos del número de crédito.
+    Retorna dict: credito_str -> [mora_act, mora_ant, mora-2, ..., mora-11]
     """
-    df  = pd.read_excel(f, header=None)
+    df  = pd.read_excel(f, header=None, dtype={0: str})
     vec = {}
     for _, r in df.iloc[1:].iterrows():
-        cred = limpiar(r.iloc[VEC_CRED] if len(r) > VEC_CRED else None)
+        cred = limpiar_cred(r.iloc[VEC_CRED] if len(r) > VEC_CRED else None)
         if not cred:
             continue
         moras = []
@@ -178,50 +216,56 @@ def proc_vector(f):
 # ─────────────────────────────────────────────
 #  ANÁLISIS PRINCIPAL
 # ─────────────────────────────────────────────
-def analizar(cartera, juridicos, calificaciones, vector):
+def analizar(cartera_tuple, juridicos, calificaciones, vector):
     """
-    Cruce:
-      1. cartera (por cédula) × juridicos (por cédula) → clientes con proceso
-      2. Para cada cliente con proceso: buscar vector por número de crédito
-      3. mora_act y mora_ant SIEMPRE vienen del vector (col B y C)
-         Solo si no hay vector usa el query como fallback (mora_act_query)
+    Lógica de cruce:
+      1. hipo_por_ced × juridicos (por cédula) → clientes hipotecarios con proceso
+      2. Para cada uno: buscar vector por número de crédito hipotecario (string exacto)
+      3. mora_act y mora_ant SIEMPRE del vector (col B y C)
+      4. Si existe crédito consumo para esa cédula: validar su mora del query
+         - mora_consumo < 30 → OK, flujo normal
+         - mora_consumo >= 30 → bloquea retiro/suspender, genera alerta
+      5. El crédito consumo NUNCA se busca en el vector (solo hipotecarios van ahí)
     """
-    if not cartera or not juridicos or not vector:
+    if not cartera_tuple or not juridicos or not vector:
         return []
 
+    hipo_por_ced, cons_por_ced = cartera_tuple
     jur_set    = set(juridicos.keys())
     resultados = []
 
-    for ced, dat in cartera.items():
-        # ── Paso 1: solo clientes con proceso jurídico ──
+    for ced, dat in hipo_por_ced.items():
+        # ── Solo clientes con proceso jurídico ──
         if ced not in jur_set:
             continue
 
-        cred             = dat["credito"]
-        capital          = dat["capital"]
-        tipo             = dat["tipo"]
-        etapa            = juridicos.get(ced, "")
-        mora_act_query   = dat["dias_mora"] or 0   # solo como fallback
+        cred    = dat["credito"]   # número crédito hipotecario (string exacto)
+        capital = dat["capital"]
+        etapa   = juridicos.get(ced, "")
 
-        # ── Paso 2: vector por número de crédito ──
+        # ── Mora consumo del query (si existe crédito consumo para esta cédula) ──
+        cons      = cons_por_ced.get(ced)
+        mora_cons = cons["dias_mora"] if cons else None
+        alerta_cons = (mora_cons is not None and mora_cons >= MORA_LIM)
+
+        # ── Vector por número de crédito hipotecario (match exacto string) ──
         vec = vector.get(cred)
 
-        # ── Paso 3: mora siempre del vector ──
+        # mora_act y mora_ant SIEMPRE del vector
         if vec and len(vec) >= 1 and vec[0] is not None:
-            mora_act = vec[0]          # col B del vector
+            mora_act = vec[0]
         else:
-            mora_act = mora_act_query  # fallback si no hay vector
+            mora_act = dat["dias_mora"] or 0   # fallback al query solo si no hay vector
 
         mora_ant = vec[1] if (vec and len(vec) > 1 and vec[1] is not None) else None
 
         if not vec:
             vec = [mora_act]
 
-        # ── Evaluar regla con el vector completo ──
+        # ── Evaluar regla del vector ──
         cumple, meses_ok, tiene_gabela = evaluar_regla(vec)
         meses_falt = meses_para_cumplir(vec)
 
-        # Etiqueta legible del mes proyectado de salida
         if meses_falt is not None and meses_falt > 0:
             mes_salida_lbl = mes_label(meses_falt)
         elif meses_falt == 0:
@@ -229,29 +273,38 @@ def analizar(cartera, juridicos, calificaciones, vector):
         else:
             mes_salida_lbl = "—"
 
-        # ── Estado procesal ──
-        if cumple:
+        # ── Estado procesal — bloqueado si consumo en mora ──
+        if cumple and not alerta_cons:
             estado = "RETIRAR"
             sufijo = " (con gabela)" if tiene_gabela else ""
             rec    = f"{meses_ok}/5 meses OK{sufijo}"
             prio   = 1
-        elif mora_act < MORA_LIM and (mora_ant is None or mora_ant >= MORA_LIM):
+        elif cumple and alerta_cons:
+            # Cumple la regla del vector pero consumo está en mora → bloquear
+            estado = "ALERTA CONSUMO"
+            rec    = f"Cumple regla Hipo pero consumo tiene {mora_cons} días mora"
+            prio   = 2
+        elif mora_act < MORA_LIM and (mora_ant is None or mora_ant >= MORA_LIM) and not alerta_cons:
             estado = "SUSPENDER"
             rec    = "Entró al día este mes — iniciar monitoreo"
+            prio   = 3
+        elif mora_act < MORA_LIM and (mora_ant is None or mora_ant >= MORA_LIM) and alerta_cons:
+            estado = "ALERTA CONSUMO"
+            rec    = f"Hipo al día pero consumo tiene {mora_cons} días mora"
             prio   = 2
         elif mora_act < MORA_LIM:
             estado = "MONITOREO"
             rec    = f"{meses_ok}/5 meses OK — continuar seguimiento"
-            prio   = 3
+            prio   = 4
         else:
             estado = "MANTENER"
-            rec    = f"Mora: {mora_act} días"
-            prio   = 4
+            rec    = f"Mora Hipo: {mora_act} días"
+            prio   = 5
 
         # ── Alerta rodando ──
         rodando = (mora_ant is not None and mora_ant < MORA_LIM and mora_act >= MORA_LIM)
 
-        # ── Provisiones: mora_act = 0 Y mora_ant = 0 (exactamente cero) ──
+        # ── Provisiones: mora_act = 0 Y mora_ant = 0 exactamente ──
         ok2 = (len(vec) >= 2
                and vec[0] is not None and vec[0] == 0
                and vec[1] is not None and vec[1] == 0)
@@ -269,10 +322,13 @@ def analizar(cartera, juridicos, calificaciones, vector):
             "cedula":          ced,
             "credito":         cred,
             "capital":         capital,
-            "tipo":            tipo,
+            "tipo":            "Hipo",
             "etapa":           etapa,
             "mora_act":        mora_act,
             "mora_ant":        mora_ant,
+            "mora_cons":       mora_cons,
+            "alerta_cons":     alerta_cons,
+            "cred_cons":       cons["credito"] if cons else None,
             "vec":             vec,
             "meses_ok":        meses_ok,
             "cumple":          cumple,
@@ -291,6 +347,7 @@ def analizar(cartera, juridicos, calificaciones, vector):
 
     resultados.sort(key=lambda x: (x["prio"], -x["capital"]))
     return resultados
+
 
 
 def calc_proyeccion(res):
@@ -348,7 +405,7 @@ def calc_hist_suspensiones(res):
 # ─────────────────────────────────────────────
 #  SESSION STATE
 # ─────────────────────────────────────────────
-for k, v in [("cartera",{}),("juridicos",{}),("calificaciones",{}),
+for k, v in [("cartera",({},{})),("juridicos",{}),("calificaciones",{}),
               ("vector",{}),("resultados",[])]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -360,7 +417,7 @@ with st.sidebar:
     st.header("📂 Archivos")
 
     for cfg in [
-        ("1 · Query Cartera",       "Hojas Hipo y Con · Col A,F,M,T", "up_car", proc_cartera,        "cartera",        lambda r: f"✓ {len(r)} clientes"),
+        ("1 · Query Cartera",       "Hojas Hipo y Con · Col A,F,M,T", "up_car", proc_cartera,        "cartera",        lambda r: f"✓ {len(r[0])} hipotecarios · {len(r[1])} consumo"),
         ("2 · Procesos Jurídicos",  "Col A: Cédula · Col M: Etapa",   "up_jur", proc_juridicos,      "juridicos",      lambda r: f"✓ {len(r)} con proceso"),
         ("3 · Vector de Moras",     "Col A: Crédito · Col B-M: Mora mes actual→mes-11", "up_vec", proc_vector, "vector", lambda r: f"✓ {len(r)} vectores"),
         ("4 · Calificaciones",      "Col A: Crédito · Col B: A-E3 (opcional)", "up_cal", proc_calificaciones, "calificaciones", lambda r: f"✓ {len(r)} calificaciones"),
@@ -380,7 +437,8 @@ with st.sidebar:
         st.divider()
 
     if st.button("🔍 Analizar", type="primary", use_container_width=True):
-        if not st.session_state.cartera:
+        hipo, cons = st.session_state.cartera
+        if not hipo:
             st.warning("Sube el Query Cartera.")
         elif not st.session_state.juridicos:
             st.warning("Sube los Procesos Jurídicos.")
@@ -421,22 +479,24 @@ if not res:
     st.stop()
 
 # ── KPIs ──────────────────────────────────────
-total     = len(res)
-retirar   = sum(1 for r in res if r["estado"]=="RETIRAR")
-suspender = sum(1 for r in res if r["estado"]=="SUSPENDER")
-monitoreo = sum(1 for r in res if r["estado"]=="MONITOREO")
-mantener  = sum(1 for r in res if r["estado"]=="MANTENER")
-n_rod     = sum(1 for r in res if r["rodando"])
-mejoran   = sum(1 for r in res if r["mejora"])
-lib_tot   = sum(r["liberacion"] for r in res)
+total       = len(res)
+retirar     = sum(1 for r in res if r["estado"]=="RETIRAR")
+suspender   = sum(1 for r in res if r["estado"]=="SUSPENDER")
+monitoreo   = sum(1 for r in res if r["estado"]=="MONITOREO")
+mantener    = sum(1 for r in res if r["estado"]=="MANTENER")
+alert_cons  = sum(1 for r in res if r["estado"]=="ALERTA CONSUMO")
+n_rod       = sum(1 for r in res if r["rodando"])
+mejoran     = sum(1 for r in res if r["mejora"])
+lib_tot     = sum(r["liberacion"] for r in res)
 
-c1,c2,c3,c4,c5,c6 = st.columns(6)
-c1.metric("Total con proceso",    total)
-c2.metric("🔴 Retirar",           retirar)
-c3.metric("🟡 Suspender",         suspender)
-c4.metric("🔵 Monitoreo",         monitoreo)
-c5.metric("🚨 Rodando este mes",  n_rod, delta="deterioro" if n_rod else None, delta_color="inverse")
-c6.metric("💚 Libera provisión",  fmt_cop(lib_tot), f"{mejoran} clientes" if mejoran else None)
+c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
+c1.metric("Total con proceso",     total)
+c2.metric("🔴 Retirar",            retirar)
+c3.metric("🟡 Suspender",          suspender)
+c4.metric("🔵 Monitoreo",          monitoreo)
+c5.metric("🟠 Alerta consumo",     alert_cons)
+c6.metric("🚨 Rodando este mes",   n_rod, delta="deterioro" if n_rod else None, delta_color="inverse")
+c7.metric("💚 Libera provisión",   fmt_cop(lib_tot), f"{mejoran} clientes" if mejoran else None)
 
 st.divider()
 
@@ -555,6 +615,7 @@ tabs = st.tabs([
     f"🟡 Suspender ({suspender})",
     f"🔵 Monitoreo ({monitoreo})",
     f"⚫ Mantener ({mantener})",
+    f"🟠 Alerta consumo ({alert_cons})",
     f"🚨 Rodando ({n_rod})",
     f"💚 Mejoran cal. ({mejoran})",
 ])
@@ -564,6 +625,7 @@ filtros = [
     lambda r: r["estado"]=="SUSPENDER",
     lambda r: r["estado"]=="MONITOREO",
     lambda r: r["estado"]=="MANTENER",
+    lambda r: r["estado"]=="ALERTA CONSUMO",
     lambda r: r["rodando"],
     lambda r: r["mejora"],
 ]
@@ -577,19 +639,21 @@ for i, (tab, filtro) in enumerate(zip(tabs, filtros)):
         rows = []
         for r in filas:
             row = {
-                "Estado":              r["estado"],
-                "Cédula":              r["cedula"],
-                "Crédito":             r["credito"],
-                "Tipo":                "Hipo" if r["tipo"]=="Hipo" else "Cons.",
-                "Capital":             r["capital"],
-                "Mora actual":         r["mora_act"],
-                "Mora anterior":       r["mora_ant"],
-                "Vector 5m":           vec_vis(r["vec"]),
-                "OK/5":                f"{r['meses_ok']}/5",
-                "Gabela":              "Sí" if r["tiene_gabela"] else "—",
+                "Estado":                r["estado"],
+                "Cédula":                r["cedula"],
+                "Cred. Hipo":            r["credito"],
+                "Cred. Consumo":         r["cred_cons"] or "—",
+                "Capital":               r["capital"],
+                "Mora Hipo actual":      r["mora_act"],
+                "Mora Hipo anterior":    r["mora_ant"],
+                "Mora Consumo":          r["mora_cons"] if r["mora_cons"] is not None else "—",
+                "Alerta consumo":        "⚠️ Sí" if r["alerta_cons"] else "—",
+                "Vector 5m":             vec_vis(r["vec"]),
+                "OK/5":                  f"{r['meses_ok']}/5",
+                "Gabela":                "Sí" if r["tiene_gabela"] else "—",
                 "Mes proyectado salida": r["mes_salida_lbl"],
-                "Etapa":               r["etapa"],
-                "Nota":                r["rec"],
+                "Etapa":                 r["etapa"],
+                "Nota":                  r["rec"],
             }
             if tiene_cal:
                 row["Cal. actual"] = r["cal_act"] or "—"
@@ -599,9 +663,9 @@ for i, (tab, filtro) in enumerate(zip(tabs, filtros)):
 
         df_t = pd.DataFrame(rows)
         ccfg = {
-            "Capital":       st.column_config.NumberColumn(format="$ %d"),
-            "Mora actual":   st.column_config.NumberColumn(format="%d d"),
-            "Mora anterior": st.column_config.NumberColumn(format="%d d"),
+            "Capital":            st.column_config.NumberColumn(format="$ %d"),
+            "Mora Hipo actual":   st.column_config.NumberColumn(format="%d d"),
+            "Mora Hipo anterior": st.column_config.NumberColumn(format="%d d"),
         }
         if tiene_cal:
             ccfg["Liberación"] = st.column_config.NumberColumn(format="$ %d")
